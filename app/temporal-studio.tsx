@@ -1,12 +1,12 @@
 "use client";
 
 import { ChangeEvent, Suspense, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
-import { Environment, Grid, OrbitControls } from "@react-three/drei";
+import { Canvas, ThreeEvent, useFrame } from "@react-three/fiber";
+import { Grid, Html, OrbitControls } from "@react-three/drei";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import * as THREE from "three";
 
-const FRAME_COUNT = 48;
+const FRAME_COUNT = 120;
 const MAX_FRAME_EDGE = 384;
 const CUBE_WIDTH = 2.8;
 const CUBE_HEIGHT = 2.35;
@@ -14,12 +14,25 @@ const CUBE_DEPTH = 3.2;
 
 type TemporalFrameData = { time: number; canvas: HTMLCanvasElement };
 type VideoMetadata = { duration: number; width: number; height: number };
+type InteractionMode = "timeline" | "slice" | "inspect";
 
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "00:00.00";
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${String(mins).padStart(2, "0")}:${secs.toFixed(2).padStart(5, "0")}`;
+}
+
+function FrameThumbnail({ frame }: { frame: TemporalFrameData | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const target = canvasRef.current;
+    const context = target?.getContext("2d");
+    if (!target || !context) return;
+    context.clearRect(0, 0, target.width, target.height);
+    if (frame) context.drawImage(frame.canvas, 0, 0, target.width, target.height);
+  }, [frame]);
+  return <canvas ref={canvasRef} className="inspection-thumbnail" width={128} height={72} aria-label={frame ? `Frame at ${formatTime(frame.time)}` : "No frame selected"} />;
 }
 
 function waitForMetadata(video: HTMLVideoElement, isCurrent: () => boolean, signal: AbortSignal) {
@@ -99,7 +112,7 @@ async function extractVideoFrames(url: string, isCurrent: () => boolean, onProgr
       throw new Error("This video has no usable duration or dimensions.");
     }
     const metadata = { duration, width, height } satisfies VideoMetadata;
-    const count = Math.min(FRAME_COUNT, Math.max(2, Math.ceil(duration * 2)));
+    const count = Math.min(FRAME_COUNT, Math.max(2, Math.ceil(duration * 4)));
     const frames: TemporalFrameData[] = [];
     for (let index = 0; index < count; index += 1) {
       if (!isCurrent()) throw new Error("Frame extraction was cancelled.");
@@ -117,111 +130,229 @@ async function extractVideoFrames(url: string, isCurrent: () => boolean, onProgr
   }
 }
 
-function TemporalFrames({ frames, depthScale, timeProgress, duration, onSeek }: {
+function createCoverGeometry(width: number, height: number, videoAspect: number) {
+  const geometry = new THREE.PlaneGeometry(width, height);
+  const uv = geometry.attributes.uv as THREE.BufferAttribute;
+  const planeAspect = width / height;
+  const uScale = videoAspect > planeAspect ? planeAspect / videoAspect : 1;
+  const vScale = videoAspect < planeAspect ? videoAspect / planeAspect : 1;
+  const uOffset = (1 - uScale) / 2;
+  const vOffset = (1 - vScale) / 2;
+  for (let index = 0; index < uv.count; index += 1) {
+    uv.setXY(index, uOffset + uv.getX(index) * uScale, vOffset + uv.getY(index) * vScale);
+  }
+  uv.needsUpdate = true;
+  return geometry;
+}
+
+function VideoProjection({ video, frames, opacity, depthScale, duration, onSeek, controlsRef }: {
+  video: HTMLVideoElement | null;
   frames: TemporalFrameData[];
+  opacity: number;
   depthScale: number;
-  timeProgress: React.MutableRefObject<number>;
   duration: number;
   onSeek: (time: number) => void;
+  controlsRef: React.RefObject<OrbitControlsImpl>;
 }) {
-  const playhead = useRef<THREE.Group>(null);
+  const texture = useMemo(() => {
+    if (!video) return null;
+    const result = new THREE.VideoTexture(video);
+    result.colorSpace = THREE.SRGBColorSpace;
+    result.minFilter = THREE.LinearFilter;
+    result.magFilter = THREE.LinearFilter;
+    result.generateMipmaps = false;
+    return result;
+  }, [video]);
+  const material = useMemo(() => texture ? new THREE.MeshBasicMaterial({
+    map: texture, side: THREE.DoubleSide, transparent: true, opacity,
+    depthWrite: false, toneMapped: false,
+  }) : null, [texture]);
   const frameTextures = useMemo(() => frames.map(({ canvas }) => {
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.minFilter = THREE.LinearFilter;
-    texture.magFilter = THREE.LinearFilter;
-    texture.generateMipmaps = false;
-    return texture;
+    const frameTexture = new THREE.CanvasTexture(canvas);
+    frameTexture.colorSpace = THREE.SRGBColorSpace;
+    frameTexture.minFilter = THREE.LinearFilter;
+    frameTexture.magFilter = THREE.LinearFilter;
+    frameTexture.generateMipmaps = false;
+    return frameTexture;
   }), [frames]);
-
-  useEffect(() => () => frameTextures.forEach(texture => texture.dispose()), [frameTextures]);
-
-  useFrame(() => {
-    if (playhead.current) playhead.current.position.z = (timeProgress.current - 0.5) * CUBE_DEPTH * depthScale;
-  });
-
-  const dimensions = useMemo(() => frames.map(({ canvas }) => {
-    const ratio = canvas.width / canvas.height;
-    const width = Math.min(0.31, 0.27 * ratio);
-    return [width, width / ratio] as const;
-  }), [frames]);
-  const borderGeometries = useMemo(() => dimensions.map(([width, height]) => {
-    const source = new THREE.PlaneGeometry(width + 0.018, height + 0.018);
-    const edges = new THREE.EdgesGeometry(source);
-    source.dispose();
-    return edges;
-  }), [dimensions]);
-  const playheadEdges = useMemo(() => {
-    const source = new THREE.PlaneGeometry(CUBE_WIDTH, CUBE_HEIGHT);
+  const frameMaterials = useMemo(() => frameTextures.map(frameTexture => new THREE.MeshBasicMaterial({
+    map: frameTexture, side: THREE.DoubleSide, transparent: true,
+    opacity: 0,
+    depthWrite: false, toneMapped: false,
+  })), [frameTextures]);
+  const wasPlaying = useRef(false);
+  const dragging = useRef(false);
+  const projection = useRef<THREE.Group>(null);
+  const videoAspect = video?.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
+  const sliceGeometry = useMemo(() => createCoverGeometry(CUBE_WIDTH, CUBE_HEIGHT, videoAspect), [videoAspect]);
+  const screenEdges = useMemo(() => {
+    const source = new THREE.PlaneGeometry(CUBE_WIDTH + 0.018, CUBE_HEIGHT + 0.018);
     const edges = new THREE.EdgesGeometry(source);
     source.dispose();
     return edges;
   }, []);
-  useEffect(() => () => borderGeometries.forEach(geometry => geometry.dispose()), [borderGeometries]);
-  useEffect(() => () => playheadEdges.dispose(), [playheadEdges]);
+  const wallGeometry = useMemo(() => {
+    const geometries = [
+      createCoverGeometry(CUBE_WIDTH, CUBE_HEIGHT, videoAspect),
+      createCoverGeometry(CUBE_WIDTH, CUBE_HEIGHT, videoAspect),
+      createCoverGeometry(CUBE_WIDTH, CUBE_DEPTH, videoAspect),
+      createCoverGeometry(CUBE_WIDTH, CUBE_DEPTH, videoAspect),
+      createCoverGeometry(CUBE_DEPTH, CUBE_HEIGHT, videoAspect),
+      createCoverGeometry(CUBE_DEPTH, CUBE_HEIGHT, videoAspect),
+    ];
+    return geometries;
+  }, [videoAspect]);
+  const wallTransforms = [
+    { position: [0, 0, -CUBE_DEPTH / 2 + 0.006] as [number, number, number], rotation: [0, 0, 0] as [number, number, number] },
+    { position: [0, 0, CUBE_DEPTH / 2 - 0.006] as [number, number, number], rotation: [0, Math.PI, 0] as [number, number, number] },
+    { position: [0, CUBE_HEIGHT / 2 - 0.006, 0] as [number, number, number], rotation: [-Math.PI / 2, 0, 0] as [number, number, number] },
+    { position: [0, -CUBE_HEIGHT / 2 + 0.006, 0] as [number, number, number], rotation: [Math.PI / 2, 0, 0] as [number, number, number] },
+    { position: [-CUBE_WIDTH / 2 + 0.006, 0, 0] as [number, number, number], rotation: [0, -Math.PI / 2, 0] as [number, number, number] },
+    { position: [CUBE_WIDTH / 2 - 0.006, 0, 0] as [number, number, number], rotation: [0, Math.PI / 2, 0] as [number, number, number] },
+  ];
+
+  useEffect(() => {
+    if (material) material.opacity = opacity;
+  }, [material, opacity]);
+  useEffect(() => () => texture?.dispose(), [texture]);
+  useEffect(() => () => material?.dispose(), [material]);
+  useEffect(() => () => frameTextures.forEach(frameTexture => frameTexture.dispose()), [frameTextures]);
+  useEffect(() => () => frameMaterials.forEach(frameMaterial => frameMaterial.dispose()), [frameMaterials]);
+  useEffect(() => () => sliceGeometry.dispose(), [sliceGeometry]);
+  useEffect(() => () => wallGeometry.forEach(geometry => geometry.dispose()), [wallGeometry]);
+  useEffect(() => () => screenEdges.dispose(), [screenEdges]);
+
+  useEffect(() => {
+    frameMaterials.forEach(frameMaterial => { frameMaterial.opacity = opacity / Math.max(1, Math.sqrt(frameMaterials.length)); });
+    if (material) material.opacity = opacity;
+  }, [frameMaterials, material, opacity]);
+
+  useFrame(() => {
+    if (projection.current && video && duration > 0) {
+      const progress = THREE.MathUtils.clamp(video.currentTime / duration, 0, 1);
+      projection.current.position.z = (progress - 0.5) * CUBE_DEPTH;
+    }
+  });
+
+  const seekFromDepth = (z: number) => {
+    if (duration <= 0) return;
+    const depth = CUBE_DEPTH * depthScale;
+    const progress = THREE.MathUtils.clamp((z / (depth * 0.94)) + 0.5, 0, 1);
+    onSeek(progress * duration);
+  };
+  const beginDepthDrag = (event: ThreeEvent<PointerEvent>) => {
+    if (event.nativeEvent.button !== 0) return;
+    event.stopPropagation();
+    dragging.current = true;
+    wasPlaying.current = Boolean(video && !video.paused);
+    video?.pause();
+    if (controlsRef.current) controlsRef.current.enabled = false;
+    (event.target as unknown as { setPointerCapture: (pointerId: number) => void }).setPointerCapture(event.pointerId);
+    seekFromDepth(event.point.z);
+  };
+  const moveDepthDrag = (event: ThreeEvent<PointerEvent>) => {
+    if (!dragging.current) return;
+    event.stopPropagation();
+    seekFromDepth(event.point.z);
+  };
+  const endDepthDrag = (event: ThreeEvent<PointerEvent>) => {
+    if (!dragging.current) return;
+    event.stopPropagation();
+    dragging.current = false;
+    if (controlsRef.current) controlsRef.current.enabled = true;
+    (event.target as unknown as { releasePointerCapture: (pointerId: number) => void }).releasePointerCapture(event.pointerId);
+    if (wasPlaying.current) void video?.play().catch(() => undefined);
+  };
 
   return (
-    <group>
-      {frames.map((frame, index) => {
-        // Arrange thumbnails across the cube's cross-section while keeping time strictly on Z.
-        const column = index % 8;
-        const row = Math.floor(index / 8);
-        const x = (column - 3.5) * 0.34;
-        const y = (row - 2.5) * 0.36;
-        const z = ((frame.time / Math.max(duration, 0.001)) - 0.5) * CUBE_DEPTH * depthScale;
-        const [width, height] = dimensions[index];
-        return (
-          <group key={`${frame.time}-${index}`} position={[x, y, z]} onClick={event => { event.stopPropagation(); onSeek(frame.time); }}>
-            <mesh>
-              <planeGeometry args={[width, height]} />
-              <meshBasicMaterial map={frameTextures[index]} side={THREE.DoubleSide} toneMapped={false} />
-            </mesh>
-            <lineSegments position={[0, 0, 0.002]}>
-              <primitive object={borderGeometries[index]} attach="geometry" />
-              <lineBasicMaterial color="#80dcff" transparent opacity={0.52} />
-            </lineSegments>
+    <group scale={[1, 1, depthScale]}>
+      {video && material && (
+        <>
+          {wallTransforms.map((wall, index) => (
+            <mesh key={`wall-${index}`} position={wall.position} rotation={wall.rotation} geometry={wallGeometry[index]} material={material} renderOrder={1} />
+          ))}
+          {frameMaterials.map((frameMaterial, index) => {
+            const progress = frameMaterials.length > 1 ? index / (frameMaterials.length - 1) : 0.5;
+            const position = (progress - 0.5) * CUBE_DEPTH * 0.92;
+            return <mesh key={`slice-${index}`} position={[0, 0, position]} geometry={sliceGeometry} material={frameMaterial} renderOrder={2} />;
+          })}
+          <group ref={projection}>
+          <mesh geometry={sliceGeometry} material={material} renderOrder={3} />
+          <lineSegments position={[0, 0, 0.006]}>
+            <primitive object={screenEdges} attach="geometry" />
+            <lineBasicMaterial color="#b6e6ed" transparent opacity={0.48} />
+          </lineSegments>
           </group>
-        );
-      })}
-      <group ref={playhead}>
-        <mesh>
-          <planeGeometry args={[CUBE_WIDTH, CUBE_HEIGHT]} />
-          <meshBasicMaterial color="#55d9ff" transparent opacity={0.075} side={THREE.DoubleSide} depthWrite={false} />
-        </mesh>
-        <lineSegments>
-          <primitive object={playheadEdges} attach="geometry" />
-          <lineBasicMaterial color="#66dcff" transparent opacity={0.9} />
-        </lineSegments>
-      </group>
+          <mesh position={[CUBE_WIDTH / 2 - 0.045, 0, 0]} rotation={[0, Math.PI / 2, 0]}
+            onPointerDown={beginDepthDrag} onPointerMove={moveDepthDrag} onPointerUp={endDepthDrag} onPointerCancel={endDepthDrag}>
+            <planeGeometry args={[CUBE_DEPTH * 0.94, CUBE_HEIGHT * 0.35]} />
+            <meshBasicMaterial color="#8bdae8" transparent opacity={0.12} side={THREE.DoubleSide} depthWrite={false} />
+          </mesh>
+          <mesh position={[CUBE_WIDTH / 2 - 0.035, 0, 0]} rotation={[0, Math.PI / 2, 0]}>
+            <planeGeometry args={[CUBE_DEPTH * 0.94, 0.014]} />
+            <meshBasicMaterial color="#b3edf5" transparent opacity={0.68} side={THREE.DoubleSide} depthWrite={false} />
+          </mesh>
+        </>
+      )}
     </group>
   );
 }
 
-const StableTemporalFrames = memo(TemporalFrames, (previous, next) =>
-  previous.frames === next.frames && previous.depthScale === next.depthScale &&
-  previous.timeProgress === next.timeProgress && previous.duration === next.duration && previous.onSeek === next.onSeek
-);
-
-function Scene({ frames, currentTime, duration, depthScale, onSeek, resetKey, controlsRef }: {
+function Scene({ video, frames, duration, depthScale, frameOpacity, autoRotate, playing, playbackVideo, onSeek, resetKey, controlsRef }: {
+  video: HTMLVideoElement | null;
   frames: TemporalFrameData[];
-  currentTime: number;
   duration: number;
   depthScale: number;
+  frameOpacity: number;
+  autoRotate: boolean;
+  playing: boolean;
+  playbackVideo: React.RefObject<HTMLVideoElement | null>;
   onSeek: (time: number) => void;
   resetKey: number;
   controlsRef: React.RefObject<OrbitControlsImpl>;
 }) {
   const timeProgress = useRef(0);
+  const playhead = useRef<THREE.Group>(null);
+  const sliceLabel = useRef<HTMLSpanElement>(null);
+  const manualInteraction = useRef(false);
   const boundsGeometry = useMemo(() => {
     const box = new THREE.BoxGeometry(CUBE_WIDTH, CUBE_HEIGHT, CUBE_DEPTH);
     const edges = new THREE.EdgesGeometry(box);
     box.dispose();
     return edges;
   }, []);
-  useEffect(() => () => boundsGeometry.dispose(), [boundsGeometry]);
-  useEffect(() => {
-    timeProgress.current = duration > 0 ? THREE.MathUtils.clamp(currentTime / duration, 0, 1) : 0;
-  }, [currentTime, duration]);
+  const playheadEdges = useMemo(() => {
+    const source = new THREE.PlaneGeometry(CUBE_WIDTH, CUBE_HEIGHT);
+    const edges = new THREE.EdgesGeometry(source);
+    source.dispose();
+    return edges;
+  }, []);
+  const starGeometry = useMemo(() => {
+    const positions = new Float32Array(180 * 3);
+    for (let index = 0; index < 180; index += 1) {
+      const values = [index * 127.1, index * 311.7, index * 74.7].map(value => {
+        const sine = Math.sin(value) * 43758.5453;
+        return (sine - Math.floor(sine)) * 2 - 1;
+      });
+      const length = Math.hypot(values[0], values[1], values[2]) || 1;
+      const radius = 6.2 + ((index * 17) % 29) / 10;
+      positions[index * 3] = (values[0] / length) * radius;
+      positions[index * 3 + 1] = (values[1] / length) * radius;
+      positions[index * 3 + 2] = (values[2] / length) * radius;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    return geometry;
+  }, []);
+  useEffect(() => () => { boundsGeometry.dispose(); playheadEdges.dispose(); starGeometry.dispose(); }, [boundsGeometry, playheadEdges, starGeometry]);
+  useFrame(() => {
+    const source = playbackVideo.current;
+    if (source && duration > 0) timeProgress.current = THREE.MathUtils.clamp(source.currentTime / duration, 0, 1);
+    if (playhead.current) playhead.current.position.z = (timeProgress.current - 0.5) * CUBE_DEPTH * depthScale;
+    if (sliceLabel.current) sliceLabel.current.textContent = formatTime(timeProgress.current * duration);
+    const controls = controlsRef.current;
+    if (controls) controls.autoRotate = autoRotate && !playing && !manualInteraction.current;
+  });
   useEffect(() => {
     if (resetKey) controlsRef.current?.reset();
   }, [resetKey, controlsRef]);
@@ -229,19 +360,61 @@ function Scene({ frames, currentTime, duration, depthScale, onSeek, resetKey, co
   return (
     <>
       <color attach="background" args={["#070a10"]} />
-      <ambientLight intensity={1.5} />
-      <pointLight position={[4, 4, 5]} intensity={18} color="#77dfff" />
-      <pointLight position={[-4, -2, -3]} intensity={10} color="#7865ff" />
+      <points geometry={starGeometry}>
+        <pointsMaterial color="#c6d2dc" size={0.018} transparent opacity={0.56} sizeAttenuation depthWrite={false} />
+      </points>
+      <ambientLight intensity={0.65} />
+      <pointLight position={[3.5, 3, 4]} intensity={12} color="#b4d8e8" />
+      <pointLight position={[-3, -2, -3]} intensity={6} color="#47708a" />
       <Suspense fallback={null}>
-        {frames.length > 0 && <StableTemporalFrames frames={frames} depthScale={depthScale} timeProgress={timeProgress} duration={duration} onSeek={onSeek} />}
-        <Environment preset="city" />
+        <VideoProjection video={video} frames={frames} opacity={frameOpacity} depthScale={depthScale} duration={duration} onSeek={onSeek} controlsRef={controlsRef} />
       </Suspense>
+      <mesh scale={[1, 1, depthScale]}>
+        <boxGeometry args={[CUBE_WIDTH, CUBE_HEIGHT, CUBE_DEPTH]} />
+        <meshPhysicalMaterial color="#b7c5cb" transparent opacity={0.045} roughness={0.24} metalness={0.16} clearcoat={0.7} clearcoatRoughness={0.24} side={THREE.DoubleSide} depthWrite={false} envMapIntensity={0.55} />
+      </mesh>
       <lineSegments scale={[1, 1, depthScale]}>
         <primitive object={boundsGeometry} attach="geometry" />
-        <lineBasicMaterial color="#77dfff" transparent opacity={0.78} />
+        <lineBasicMaterial color="#b9c8cf" transparent opacity={0.58} />
       </lineSegments>
+      <group ref={playhead}>
+        <mesh>
+          <planeGeometry args={[CUBE_WIDTH, CUBE_HEIGHT]} />
+          <meshBasicMaterial color="#c2ac84" transparent opacity={0.045} side={THREE.DoubleSide} depthWrite={false} />
+        </mesh>
+        <lineSegments>
+          <primitive object={playheadEdges} attach="geometry" />
+          <lineBasicMaterial color="#c9b58f" transparent opacity={0.82} />
+        </lineSegments>
+        <Html position={[CUBE_WIDTH / 2 + 0.04, CUBE_HEIGHT / 2 + 0.08, 0]} center distanceFactor={7} style={{ pointerEvents: "none" }}>
+          <span ref={sliceLabel} className="slice-scene-label">00:00.00</span>
+        </Html>
+      </group>
+      {!video && (
+        <group scale={[1, 1, depthScale]}>
+          {Array.from({ length: 13 }, (_, index) => {
+            const progress = index / 12;
+            const position = (progress - 0.5) * CUBE_DEPTH * 0.9;
+            const central = index === 6;
+            return (
+              <group key={`idle-slice-${index}`} position={[0, 0, position]}>
+                <mesh>
+                  <planeGeometry args={[CUBE_WIDTH * 0.94, CUBE_HEIGHT * 0.9]} />
+                  <meshBasicMaterial color={central ? "#c2ac84" : "#8ea5b0"} transparent opacity={central ? 0.035 : 0.012} side={THREE.DoubleSide} depthWrite={false} />
+                </mesh>
+                <lineSegments>
+                  <primitive object={playheadEdges} attach="geometry" />
+                  <lineBasicMaterial color={central ? "#c2ac84" : "#93a7af"} transparent opacity={central ? 0.42 : 0.13} />
+                </lineSegments>
+              </group>
+            );
+          })}
+        </group>
+      )}
       <Grid position={[0, -1.5, 0]} args={[12, 12]} cellSize={0.5} cellThickness={0.35} cellColor="#1a2a3a" sectionSize={2} sectionThickness={0.7} sectionColor="#27445a" fadeDistance={9} infiniteGrid />
-      <OrbitControls ref={controlsRef} enablePan={false} minDistance={2.8} maxDistance={8} enableDamping dampingFactor={0.08} />
+      <OrbitControls ref={controlsRef} enablePan minDistance={3} maxDistance={9} enableDamping dampingFactor={0.075} rotateSpeed={0.7} autoRotate={autoRotate && !playing} autoRotateSpeed={0.35}
+        onStart={() => { manualInteraction.current = true; if (controlsRef.current) controlsRef.current.autoRotate = false; }}
+        onEnd={() => { manualInteraction.current = false; }} />
     </>
   );
 }
@@ -263,6 +436,9 @@ export default function TemporalStudio() {
   const [speed, setSpeed] = useState(1);
   const [volume, setVolume] = useState(1);
   const [depthScale, setDepthScale] = useState(1);
+  const [frameOpacity, setFrameOpacity] = useState(0.82);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>("timeline");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -375,6 +551,30 @@ export default function TemporalStudio() {
     video.currentTime = Math.max(0, Math.min(duration, value));
     setCurrentTime(video.currentTime);
   }, [video, duration]);
+  const selectedFrameIndex = useMemo(() => {
+    if (!frames.length) return -1;
+    let nearestIndex = 0;
+    let nearestDistance = Infinity;
+    frames.forEach((frame, index) => {
+      const distance = Math.abs(frame.time - currentTime);
+      if (distance < nearestDistance) { nearestDistance = distance; nearestIndex = index; }
+    });
+    return nearestIndex;
+  }, [frames, currentTime]);
+  const selectedFrame = selectedFrameIndex >= 0 ? frames[selectedFrameIndex] : null;
+  const expectedFrameCount = duration > 0 ? Math.min(FRAME_COUNT, Math.max(2, Math.ceil(duration * 4))) : FRAME_COUNT;
+  const selectFrame = useCallback((index: number) => {
+    if (!frames.length) return;
+    const safeIndex = THREE.MathUtils.clamp(index, 0, frames.length - 1);
+    seek(frames[safeIndex].time);
+  }, [frames, seek]);
+  const playFromSelected = async () => {
+    if (!video || !selectedFrame) return;
+    seek(selectedFrame.time);
+    try { await video.play(); setPlaying(true); }
+    catch { setError("Playback was blocked. Try pressing play again."); }
+  };
+  const selectedPercent = selectedFrame && duration > 0 ? Math.round((selectedFrame.time / duration) * 100) : 0;
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     void loadFile(event.target.files?.[0]);
     event.target.value = "";
@@ -384,37 +584,38 @@ export default function TemporalStudio() {
     <main className="app-shell" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); void loadFile(event.dataTransfer.files?.[0]); }}>
       <header className="topbar">
         <a className="brand" href="#"><span className="brand-mark">◈</span> <span className="brand-name">4th Dimension</span></a>
-        <div className="top-status"><span className="status-dot" /> EXPLORE TIME <span className="version">BETA 0.2</span></div>
+        <div className="top-status"><span className="status-dot" /> LOCAL FILM STUDY</div>
         <button className="text-button" onClick={() => inputRef.current?.click()}>＋ Upload video</button>
       </header>
 
       <section className="hero">
-        <div className="eyebrow"><span /> AN EXPERIMENT IN TIME</div>
-        <h1>Time is more than a moment.<br /><em>Explore it in another dimension.</em></h1>
-        <p className="hero-copy">Turn ordinary video into a space you can explore.<br className="desktop-break" /> Rotate the moment. Move through time.</p>
+        <div className="eyebrow"><span /> 4TH DIMENSION / TEMPORAL OBSERVATORY</div>
+        <h1>Time, held<br /><em>in four dimensions.</em></h1>
+        <p className="hero-copy">One continuous film, suspended in space.<br className="desktop-break" /> Turn the object. Scrub its depth. Watch time move.</p>
       </section>
 
       <section className="workspace">
         <div className="scene-panel">
           <div className="scene-topline">
             <div><span className="micro-label">TEMPORAL CUBE</span><span className="scene-name">{fileName || "Untitled temporal object"}</span></div>
-            <div className="view-pill"><span className="status-dot" /> {loading ? `EXTRACTING ${progress}/${FRAME_COUNT}` : frames.length ? `${frames.length} FRAMES` : "3D SPACE"}</div>
+            <div className="view-pill"><span className="status-dot" /> {loading ? "MAPPING SOURCE" : video ? "FILM IN SPACE" : "3D SPACE"}</div>
           </div>
           <div className="canvas-wrap">
             <Canvas camera={{ position: [3.6, 2.5, 4.5], fov: 43 }} dpr={[1, 1.5]}>
-              <Scene frames={frames} currentTime={currentTime} duration={duration} depthScale={depthScale} onSeek={seek} resetKey={resetKey} controlsRef={controlsRef} />
+              <Scene video={video} frames={frames} duration={duration} depthScale={depthScale} frameOpacity={frameOpacity} autoRotate={autoRotate} playing={playing} playbackVideo={videoRef} onSeek={seek} resetKey={resetKey} controlsRef={controlsRef} />
             </Canvas>
-            {frames.length === 0 && !loading && (
+            {!video && frames.length === 0 && !loading && (
               <div className="empty-overlay">
                 <div className="upload-symbol">↥</div>
-                <p className="empty-title">Give time a new dimension</p>
-                <p className="empty-copy">Upload a video to map its moments through a temporal cube.</p>
-                <button className="primary-button" onClick={() => inputRef.current?.click()}>Select a video <span>↗</span></button>
-                <span className="file-hint">MP4 · WEBM · MOV</span>
+                <p className="empty-kicker">VOLUME / STANDBY</p>
+                <p className="empty-title">The cube is waiting for a film.</p>
+                <p className="empty-copy">Load a video to fill the volume with time.</p>
+                <button className="primary-button" onClick={() => inputRef.current?.click()}>Load film <span>↗</span></button>
+                <span className="file-hint">MP4 · WEBM · MOV · LOCAL ONLY</span>
               </div>
             )}
-            {loading && <div className="loading-overlay"><div className="loading-ring" /><strong>Extracting video moments</strong><span>{progress} of {FRAME_COUNT} frames · processing locally</span><div className="progress-track"><i style={{ width: `${(progress / FRAME_COUNT) * 100}%` }} /></div></div>}
-            <div className="canvas-hint"><span>↻</span> DRAG TO ROTATE <span className="hint-divider">/</span> SCROLL TO ZOOM</div>
+            {loading && <div className="loading-overlay"><div className="loading-ring" /><strong>Building the film volume</strong><span>{progress} of {expectedFrameCount} moments · processed on this device</span><div className="progress-track"><i style={{ width: `${(progress / expectedFrameCount) * 100}%` }} /></div></div>}
+            <div className="canvas-hint"><span>↻</span> DRAG RAIL TO MOVE THROUGH TIME <span className="hint-divider">/</span> DRAG OUTSIDE TO ORBIT <span className="hint-divider">/</span> SCROLL TO ZOOM</div>
             <div className="axis-label axis-x">X <span>WIDTH</span></div>
             <div className="axis-label axis-y">Y <span>HEIGHT</span></div>
             <div className="axis-label axis-z">Z <span>TIME</span></div>
@@ -427,9 +628,17 @@ export default function TemporalStudio() {
         </div>
 
         <aside className="control-panel">
-          <div className="panel-heading"><span className="micro-label">TIME NAVIGATION</span><span className="panel-index">01 / 03</span></div>
+          <div className="panel-heading"><div><span className="micro-label">OBSERVATORY CONSOLE</span><strong className="console-title">Navigation</strong></div><span className="panel-index">{video ? "FILM LOADED" : "LOCAL / READY"}</span></div>
+          <div className="mode-section">
+            <span className="mode-label">INTERACTION MODE</span>
+            <div className="mode-switcher" role="group" aria-label="Time interaction mode">
+              <button className={interactionMode === "timeline" ? "selected" : ""} aria-pressed={interactionMode === "timeline"} onClick={() => setInteractionMode("timeline")}>Timeline</button>
+              <button className={interactionMode === "slice" ? "selected" : ""} aria-pressed={interactionMode === "slice"} onClick={() => setInteractionMode("slice")}>Slice</button>
+              <button className={interactionMode === "inspect" ? "selected" : ""} aria-pressed={interactionMode === "inspect"} onClick={() => setInteractionMode("inspect")}>Inspect</button>
+            </div>
+          </div>
           <div className="control-section">
-            <div className="section-title">Source material <span className="step-number">01</span></div>
+            <div className="section-title">Source film <span className="step-number">01</span></div>
             <button className="upload-card" onClick={() => inputRef.current?.click()}>
               <span className="upload-card-icon">↥</span>
               <span className="upload-card-text"><strong>{fileName || "Choose a video"}</strong><small>{fileName ? "Click to replace source" : "Drop a file into this space"}</small></span>
@@ -439,10 +648,15 @@ export default function TemporalStudio() {
           </div>
 
           <div className="control-section">
-            <div className="section-title">Navigate time <span className="step-number">02</span></div>
+            <div className="section-title">Time control <span className="step-number">02</span></div>
             <div className="time-readout"><strong>{formatTime(currentTime)}</strong><span>/ {formatTime(duration)}</span></div>
-            <input aria-label="Video timeline" className="range-input" type="range" min={0} max={duration || 1} step={0.01} value={Math.min(currentTime, duration || 1)} onChange={e => seek(Number(e.target.value))} style={{ "--range-progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties} />
+            <input aria-label="Video timeline" className="range-input" type="range" min={0} max={duration || 1} step={0.01} value={Math.min(currentTime, duration || 1)} disabled={!video || interactionMode === "slice" || interactionMode === "inspect"} onChange={e => seek(Number(e.target.value))} style={{ "--range-progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties} />
             <div className="range-labels"><span>BEGINNING</span><span>END</span></div>
+            <div className="slice-control">
+              <div className="depth-readout"><span>TIME SLICE</span><strong>{formatTime(currentTime)}</strong></div>
+              <input aria-label="Time Slice position" className="range-input" type="range" min={0} max={duration || 1} step={0.01} value={Math.min(currentTime, duration || 1)} disabled={!video || interactionMode !== "slice"} onChange={event => seek(Number(event.target.value))} style={{ "--range-progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties} />
+              <div className="range-labels"><span>SLICE POSITION</span><span>{selectedFrame ? `FRAME ${selectedFrameIndex + 1}` : "NO FRAME"}</span></div>
+            </div>
             <div className="transport">
               <button title="Back one second" onClick={() => seek(Math.max(0, currentTime - 1))}>↶<small>1s</small></button>
               <button className="play-button" onClick={togglePlay}>{playing ? "Ⅱ" : "▶"}</button>
@@ -451,19 +665,36 @@ export default function TemporalStudio() {
             <div className="speed-row"><label htmlFor="speed">Playback speed</label><select id="speed" value={speed} onChange={e => setSpeed(Number(e.target.value))}><option value={0.25}>0.25×</option><option value={0.5}>0.5×</option><option value={1}>1×</option><option value={1.5}>1.5×</option><option value={2}>2×</option></select></div>
           </div>
 
-          <div className="control-section">
-            <div className="section-title">Temporal depth <span className="step-number">03</span></div>
-            <div className="depth-readout"><span>FRAME SPACING</span><strong>{depthScale.toFixed(2)}×</strong></div>
+          <div className="inspection-section">
+            <div className="section-title">Frame index <span className="step-number">{interactionMode === "inspect" ? "ACTIVE" : "SAMPLES"}</span></div>
+            {selectedFrame ? (
+              <>
+                <div className="inspection-card">
+                  <FrameThumbnail frame={selectedFrame} />
+                  <div className="inspection-meta"><strong>{formatTime(selectedFrame.time)}</strong><span>FRAME {selectedFrameIndex + 1} / {frames.length}</span><span>{selectedPercent}% ELAPSED</span></div>
+                </div>
+                <div className="frame-navigation"><button disabled={selectedFrameIndex <= 0} onClick={() => selectFrame(selectedFrameIndex - 1)}>← Previous</button><button disabled={selectedFrameIndex >= frames.length - 1} onClick={() => selectFrame(selectedFrameIndex + 1)}>Next →</button></div>
+                <div className="inspection-actions"><button disabled={!video} onClick={() => selectFrame(selectedFrameIndex)}>Jump to Moment</button><button className="inspect-play" disabled={!video} onClick={() => void playFromSelected()}>Play From Here</button></div>
+              </>
+            ) : <div className="inspection-empty">Upload a video to inspect its sampled moments.</div>}
+          </div>
+
+          <div className="control-section visual-settings">
+            <div className="section-title">Cube optics <span className="step-number">03</span></div>
+            <div className="depth-readout"><span>TEMPORAL DEPTH</span><strong>{depthScale.toFixed(2)}×</strong></div>
             <input aria-label="Temporal depth" className="range-input depth-range" type="range" min={0.65} max={1.8} step={0.01} value={depthScale} onChange={event => setDepthScale(Number(event.target.value))} style={{ "--range-progress": `${((depthScale - 0.65) / 1.15) * 100}%` } as React.CSSProperties} />
             <div className="range-labels"><span>COMPRESS</span><span>EXPAND</span></div>
-            <div className="property-row"><div><strong>Frame mapping</strong><small>Local video moments</small></div><span className="property-value">{loading ? "BUILDING" : frames.length ? "ACTIVE" : "STANDBY"}</span></div>
+            <div className="depth-readout opacity-readout"><span>VIDEO PROJECTION</span><strong>{Math.round(frameOpacity * 100)}%</strong></div>
+            <input aria-label="Frame opacity" className="range-input depth-range" type="range" min={0.15} max={1} step={0.01} value={frameOpacity} onChange={event => setFrameOpacity(Number(event.target.value))} style={{ "--range-progress": `${((frameOpacity - 0.15) / 0.85) * 100}%` } as React.CSSProperties} />
+            <div className="setting-toggle-row"><span>Auto Rotate</span><button className={`setting-toggle${autoRotate ? " active" : ""}`} role="switch" aria-checked={autoRotate} onClick={() => setAutoRotate(value => !value)}><i /></button></div>
+            <div className="property-row"><div><strong>Film projection</strong><small>Continuous playback</small></div><span className="property-value">{video ? "ACTIVE" : "STANDBY"}</span></div>
             <div className="property-row"><div><strong>Playback rate</strong><small>Timeline velocity</small></div><span className="property-value">{speed.toFixed(2)}×</span></div>
           </div>
           <div className="privacy-note"><span>◈</span><p><strong>Your footage stays local.</strong><br />Video frames are processed in your browser. Files are never uploaded.</p></div>
         </aside>
       </section>
 
-      <footer className="footer"><span>4TH DIMENSION © 2026</span><span>THREE DIMENSIONS. ONE TIMELINE. INFINITE PERSPECTIVES.</span><span>BUILT TO EXPLORE</span></footer>
+      <footer className="footer"><span>4TH DIMENSION © 2026</span><span>ONE FILM · EVERY MOMENT</span><span>VIDEO STAYS LOCAL</span></footer>
       <input ref={inputRef} type="file" accept="video/*" hidden onChange={onFileChange} />
     </main>
   );
